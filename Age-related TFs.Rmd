@@ -1,0 +1,192 @@
+---
+title: "Associating human age-related genes to human transcription factors"
+author: "Wen Lim"
+date: "2025-05-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# one-off installation -------------------------------------------------
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c(
+  "readxl",      # read .xlsx
+  "readr",       # read .csv
+  "tidyverse",   # dplyr, purrr, ggplot2 …
+  "decoupleR",   # enrichment stats + helper fns
+  "dorothea"     # curated TF-target regulons
+))
+
+# every session --------------------------------------------------------
+library(readxl)
+library(readr)
+library(tidyverse)
+library(decoupleR)      # brings get_resource() & run_ora()
+library(dorothea)       # provides dorothea_hs regulons
+
+```
+
+## Load data
+
+```{r load data}
+
+## ---- GenAge list -----------------------------------------------------
+genage <- read_csv("genage_human.csv", show_col_types = FALSE) |>
+          mutate(Symbol = toupper(symbol)) |>
+          distinct(Symbol)
+
+## ---- Human TF list ---------------------------------------------------
+tfdb <- read_excel("Human TFs DatabaseExtract_v_1.01.xlsx") |>
+        filter(toupper(`Is TF?`) == "YES") |>
+        mutate(Symbol = toupper(`HGNC symbol`)) |>
+        distinct(Symbol)
+
+```
+
+## Quick check which transcription factor genes are themselves in GenAge
+
+```{r Quick check}
+
+tf_age_overlap <- intersect(tfdb$Symbol, genage$Symbol)
+length(tf_age_overlap)          # usually ~50
+tf_age_overlap                  # print the symbols if you like
+
+```
+
+## Build the TF-target network to test
+
+```{r }
+
+## pull high-confidence DoRothEA interactions (levels A & B) ------------
+data(dorothea_hs)   # loads a tibble called dorothea_hs
+
+# Map evidence letters → numeric “likelihood” weights (optional but useful)
+conf2like <- c(A = 1.0, B = 0.75, C = 0.5, D = 0.25, E = 0.05)
+
+#Build the regulon
+#Note: A regulon = one TF plus the set of genes it directly regulates, using DoRothEA resource. Each TF regulon is treated as a gene set, exactly like a KEGG pathway or GO term
+regulon <- dorothea_hs %>% 
+  filter(confidence %in% c("A", "B")) %>%           # strongest evidence only
+  transmute(
+    source     = toupper(tf),                       # rename 'tf' → 'source'
+    target     = toupper(target),                   # target gene
+    mor        = mor,                               # mode of regulation (+1/-1)
+    likelihood = conf2like[confidence]              # numeric edge weight
+  ) %>% 
+  filter(source %in% tfdb$Symbol)                   # keep only regulators in TF db
+
+```
+
+## Hypergeometric enrichment: “Is this TF’s regulon enriched for GenAge genes?”
+
+
+```{r }
+
+#Hyper-geometric test answers: Is my list of ageing genes unexpectedly over-represented among the genes that TF is known to regulate?"
+#i.e., whether the list contains more ageing genes that random chance allows
+
+#Test calculates probability of drawing the ageing gene when you sample the regulon genes, from a population of total genes in any regulon and total number of ageing genes in the universe
+#Taking intersection of TF list with GenAge list only gives TFs whose own genes appear in GenAge
+#Using regulons lets you uncover TFs that regulate ageing genes, even if the TF itself is not annotated as an ageing genes e.g., master regulators
+
+## define the universe --------------------------------------------------
+age_in_univ <- intersect(genage$Symbol, regulon$target) # ageing genes present
+
+## build the 1-column ‘matrix’ just like before
+gene_score  <- matrix(1,                                # all 1’s = “hit”
+                      nrow     = length(age_in_univ),
+                      dimnames = list(age_in_univ, "age"))
+
+## run ORA - over-representaiton analysis with one-tailed Fisher test inside
+# n_up     = number of “hits” (all ageing genes)
+# n_bottom = number of “anti-hits” (0, because the list is unsigned)
+
+ora_res <- run_ora(
+  mat      = gene_score,
+  net      = regulon,
+  n_up     = nrow(gene_score),
+  n_bottom = 0,
+  minsize  = 0          # keep even tiny regulons
+)
+
+
+## Compute per-TF statistics we care about -------------------------------
+reg_stats <- regulon %>%                           # start from the edge list
+  group_by(source) %>%                             # one row per TF
+  summarise(
+    RegulonSize = n_distinct(target),              # total genes it regulates
+    AgeingHits  = n_distinct(                      # how many are GenAge genes
+                    target[target %in% age_in_univ]
+                  ),
+    .groups = "drop"
+  )
+
+## 7·2  Join those counts back to the ORA table and add FDR -------------------
+tf_ranked <- ora_res %>% 
+  rename(TF = source) %>%                          # nicer column name
+  mutate(FDR = p.adjust(p_value, "BH")) %>%        # Benjamini–Hochberg
+  left_join(reg_stats, by = c("TF" = "source")) %>%# add hit counts & sizes
+  select(TF, p_value, FDR, AgeingHits, RegulonSize,
+         everything()) %>%                         # keep any extra cols (NES, etc.)
+  arrange(FDR)
+
+## 7·3  Quick sanity check -----------------------------------------------------
+head(tf_ranked, 10)   # should list FOXO, NFKB1, E2F … with non-NA counts
+
+```
+
+## Visualise 15 strongest TFs at a glance
+
+```{r XX}
+
+library(ggplot2)
+
+tf_ranked %>% 
+  slice_head(n = 15) %>%                        # top 15 rows
+  mutate(TF = forcats::fct_reorder(TF, FDR, .desc = TRUE)) %>% 
+  ggplot(aes(TF, -log10(FDR))) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "TF regulons enriched for GenAge genes",
+       y = expression(-log[10] * " FDR"),
+       x = NULL)
+
+```
+
+## Export the significant edges for Cytoscape 
+
+```{r XX}
+
+sig_tfs <- tf_ranked %>% 
+  filter(FDR < 0.05) %>% 
+  pull(TF)
+
+regulon %>% 
+  filter(source %in% sig_tfs) %>% 
+  write_tsv("TF_Ageing_Regulon_SigEdges.tsv")
+
+# → In Cytoscape: import as edge table; map 'mor' to edge colour,
+#   'likelihood' to edge width; run network layout of your choice.
+
+#	In the preview grid choose:
+#	“source” for Source Interaction
+#	“target” for Target Interaction
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+## Miscellaneous notes
+
+```{r XX}
+
+#Oct 3/4, Sox2 are not in transcription factor set
+# --> Oct 3/4 are not even in the human transcription factor dataset to start with?
+
+#Klf4 does not have a significant p-value
+
+
+```
