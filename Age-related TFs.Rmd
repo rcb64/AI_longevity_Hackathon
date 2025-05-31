@@ -33,12 +33,20 @@ library(dorothea)       # provides dorothea_hs regulons
 
 ```{r load data}
 
-## ---- GenAge list -----------------------------------------------------
+## ---- GenAge (Age-related genes) list --------------------------------- 
+#https://genomics.senescence.info/genes/index.html
 genage <- read_csv("genage_human.csv", show_col_types = FALSE) |>
           mutate(Symbol = toupper(symbol)) |>
           distinct(Symbol)
 
-## ---- Human TF list ---------------------------------------------------
+## ---- Alzheimer's related genes list ---------------------------------  #https://maayanlab.cloud/Harmonizome/gene_set/alzheimer/GeneRIF+Biological+Term+Annotations
+AD_genes <- read_excel("Alzheimers_genes.xlsx",      
+                  sheet = 1) %>%                # default is first sheet
+  mutate(Symbol = toupper(Symbol)) %>%            # gene → upper-case HGNC symbol
+  distinct(Symbol)
+
+## ---- Human TF list --------------------------------------------------- 
+# https://humantfs.ccbr.utoronto.ca
 tfdb <- read_excel("Human TFs DatabaseExtract_v_1.01.xlsx") |>
         filter(toupper(`Is TF?`) == "YES") |>
         mutate(Symbol = toupper(`HGNC symbol`)) |>
@@ -81,7 +89,6 @@ regulon <- dorothea_hs %>%
 ```
 
 ## Hypergeometric enrichment: “Is this TF’s regulon enriched for GenAge genes?”
-
 
 ```{r }
 
@@ -138,7 +145,57 @@ head(tf_ranked, 10)   # should list FOXO, NFKB1, E2F … with non-NA counts
 
 ```
 
-## Visualise 15 strongest TFs at a glance
+## Hypergeometric enrichment: “Is this TF’s regulon enriched for Alzheimer's genes?”
+
+```{r }
+
+## define the universe --------------------------------------------------
+age_in_univ_AD <- intersect(AD_genes$Symbol, regulon$target) # ageing genes present
+
+## build the 1-column ‘matrix’ just like before
+gene_score_AD  <- matrix(1,                                # all 1’s = “hit”
+                      nrow     = length(age_in_univ_AD),
+                      dimnames = list(age_in_univ_AD, "age"))
+
+## run ORA - over-representaiton analysis with one-tailed Fisher test inside
+# n_up     = number of “hits” (all ageing genes)
+# n_bottom = number of “anti-hits” (0, because the list is unsigned)
+
+ora_res_AD <- run_ora(
+  mat      = gene_score_AD,
+  net      = regulon,
+  n_up     = nrow(gene_score_AD),
+  n_bottom = 0,
+  minsize  = 0          # keep even tiny regulons
+)
+
+
+## Compute per-TF statistics we care about -------------------------------
+reg_stats_AD <- regulon %>%                           # start from the edge list
+  group_by(source) %>%                             # one row per TF
+  summarise(
+    RegulonSize = n_distinct(target),              # total genes it regulates
+    ADHits  = n_distinct(                      # how many are Alzheimer's genes
+                    target[target %in% age_in_univ_AD]
+                  ),
+    .groups = "drop"
+  )
+
+## 7·2  Join those counts back to the ORA table and add FDR -------------------
+tf_ranked_AD <- ora_res_AD %>% 
+  rename(TF = source) %>%                          # nicer column name
+  mutate(FDR = p.adjust(p_value, "BH")) %>%        # Benjamini–Hochberg
+  left_join(reg_stats_AD, by = c("TF" = "source")) %>%# add hit counts & sizes
+  select(TF, p_value, FDR, ADHits, RegulonSize,
+         everything()) %>%                         # keep any extra cols (NES, etc.)
+  arrange(FDR)
+
+## 7·3  Quick sanity check -----------------------------------------------------
+head(tf_ranked_AD, 10)   # should list FOXO, NFKB1, E2F … with non-NA counts
+
+```
+
+## Visualise 15 strongest TFs at a glance for Ageing and Alzheimer's genes
 
 ```{r XX}
 
@@ -151,6 +208,16 @@ tf_ranked %>%
   geom_col() +
   coord_flip() +
   labs(title = "TF regulons enriched for GenAge genes",
+       y = expression(-log[10] * " FDR"),
+       x = NULL)
+
+tf_ranked_AD %>% 
+  slice_head(n = 15) %>%                        # top 15 rows
+  mutate(TF = forcats::fct_reorder(TF, FDR, .desc = TRUE)) %>% 
+  ggplot(aes(TF, -log10(FDR))) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "TF regulons enriched for Alzheimer's genes",
        y = expression(-log[10] * " FDR"),
        x = NULL)
 
